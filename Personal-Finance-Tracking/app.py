@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -146,7 +147,16 @@ CORAL = "#E5484D"
 CATEGORY_ICON = {
     "Transport": "🚗",
     "Dining": "🍔",
+    "Food & Drink": "🍔",
     "Groceries": "🛒",
+    "Utilities": "💡",
+    "Rent": "🏠",
+    "Shopping": "🛍️",
+    "Entertainment": "🎬",
+    "Health & Fitness": "💪",
+    "Salary": "💰",
+    "Investment": "📈",
+    "Travel": "✈️",
     "Other": "💳",
 }
 
@@ -475,6 +485,21 @@ st.markdown(CSS, unsafe_allow_html=True)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error(
+        "Missing `SUPABASE_URL` and/or `SUPABASE_ANON_KEY`. Locally, set "
+        "these in `.env`. On Streamlit Community Cloud, set them under "
+        "**App settings → Secrets** as root-level keys (not inside a "
+        "`[section]`), e.g.:\n\n"
+        "```toml\n"
+        "SUPABASE_URL = \"https://xxxx.supabase.co\"\n"
+        "SUPABASE_ANON_KEY = \"your-anon-key\"\n"
+        "```\n\n"
+        "After saving secrets on Streamlit Cloud, use **Manage app → "
+        "Reboot app** — new secrets don't always take effect on their own."
+    )
+    st.stop()
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 for key, default in {
@@ -625,9 +650,37 @@ llm = LLM(
 
 
 CATEGORY_KEYWORDS = {
-    "uber": "Transport",
-    "kfc": "Dining",
-    "shoprite": "Groceries",
+    # Transport
+    "uber": "Transport", "bolt": "Transport", "taxify": "Transport", "fuel": "Transport",
+    "petrol": "Transport", "diesel": "Transport", "fare": "Transport",
+    # Dining / Food & Drink
+    "kfc": "Food & Drink", "restaurant": "Food & Drink", "eatery": "Food & Drink",
+    "chicken republic": "Food & Drink", "domino": "Food & Drink", "cafe": "Food & Drink",
+    "coffee": "Food & Drink",
+    # Groceries
+    "shoprite": "Groceries", "market": "Groceries", "supermarket": "Groceries", "spar": "Groceries",
+    # Entertainment
+    "netflix": "Entertainment", "spotify": "Entertainment", "showmax": "Entertainment",
+    "dstv": "Entertainment", "gotv": "Entertainment", "cinema": "Entertainment",
+    # Utilities
+    "phcn": "Utilities", "ikeja electric": "Utilities", "eko electric": "Utilities",
+    "electricity": "Utilities", "nepa": "Utilities", "water bill": "Utilities",
+    "mtn": "Utilities", "airtel": "Utilities", "glo": "Utilities", "9mobile": "Utilities",
+    "data bundle": "Utilities", "airtime": "Utilities",
+    # Rent
+    "rent": "Rent", "landlord": "Rent",
+    # Health & Fitness
+    "gym": "Health & Fitness", "hospital": "Health & Fitness", "pharmacy": "Health & Fitness",
+    "clinic": "Health & Fitness",
+    # Shopping
+    "jumia": "Shopping", "konga": "Shopping", "amazon": "Shopping",
+    # Salary
+    "salary": "Salary", "payroll": "Salary",
+    # Investment
+    "dividend": "Investment", "stocks": "Investment", "mutual fund": "Investment",
+    "treasury bill": "Investment",
+    # Travel
+    "flight": "Travel", "hotel": "Travel", "airbnb": "Travel", "booking.com": "Travel",
 }
 
 
@@ -637,6 +690,59 @@ def categorize(description: str) -> str:
         if key in desc:
             return cat
     return "Other"
+
+
+KNOWN_CATEGORIES = [
+    "Food & Drink", "Groceries", "Transport", "Utilities", "Rent", "Shopping",
+    "Entertainment", "Health & Fitness", "Salary", "Investment", "Travel", "Other",
+]
+
+
+def ai_categorize(descriptions: list[str]) -> dict[str, str]:
+    """
+    Real NLP fallback: sends the unique descriptions that keyword matching
+    (and the source file's own Category column, if any) couldn't place,
+    to the app's existing OpenRouter LLM, and asks it to pick the best fit
+    from KNOWN_CATEGORIES for each — actual language understanding instead
+    of rigid substring matches. Capped at 200 unique descriptions per call
+    to bound cost/latency; returns {} on any failure so callers can just
+    leave the existing "Other" labels in place.
+    """
+    api_token = os.getenv("API_TOKEN")
+    if not api_token or not descriptions:
+        return {}
+
+    batch = descriptions[:200]
+    prompt = (
+        "Classify each of these bank transaction descriptions into the single "
+        f"best-fitting category from this exact list: {KNOWN_CATEGORIES}.\n\n"
+        "Respond with ONLY a JSON object mapping each description (verbatim, "
+        "as given) to one category from that list — no other text, no markdown "
+        "code fences.\n\nDescriptions:\n"
+        + "\n".join(f"- {d}" for d in batch)
+    )
+
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_token}"},
+            json={
+                "model": "openai/gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
+        mapping = json.loads(content)
+        return {
+            desc: cat for desc, cat in mapping.items()
+            if desc in batch and cat in KNOWN_CATEGORIES
+        }
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +760,8 @@ HEADER_ALIASES = {
     "debit": ["debit", "withdrawal", " dr", "debit amount", "money out", "amount(dr)", "amount (dr)"],
     "credit": ["credit", "deposit", " cr", "credit amount", "money in", "amount(cr)", "amount (cr)"],
     "amount": ["amount", "value"],
+    "category": ["category", "categories", "expense category", "transaction category"],
+    "type": ["type", "transaction type", "txn type", "entry type"],
 }
 
 
@@ -696,6 +804,41 @@ def _load_csv(uploaded_file) -> tuple[pd.DataFrame, float]:
             "'narration', or 'details')."
         )
     date_col = col_map.get("date") or ("date" if "date" in df.columns else None)
+    category_col = col_map.get("category")
+
+    def _row_category(r) -> str | None:
+        if not category_col:
+            return None
+        val = r.get(category_col)
+        return str(val).strip() if pd.notna(val) and str(val).strip() else None
+
+    # Shape 1: an explicit Type column (e.g. "Expense"/"Income") alongside a
+    # single, always-positive Amount column. This is common in synthetic/
+    # exported datasets and can't be told apart by sign or separate debit/
+    # credit columns — without this branch, Income rows would be silently
+    # miscounted as spending.
+    amount_col_generic = col_map.get("amount") or ("value" if "value" in df.columns else None)
+    if "type" in col_map and amount_col_generic:
+        rows = []
+        total_in = 0.0
+        for _, r in df.iterrows():
+            desc = r.get(desc_col)
+            if pd.isna(desc) or not str(desc).strip():
+                continue
+            amt = _clean_number(r[amount_col_generic])
+            if amt is None:
+                continue
+            type_val = str(r.get(col_map["type"], "")).strip().lower()
+            if "income" in type_val or "credit" in type_val or "deposit" in type_val:
+                total_in += amt
+                continue
+            rows.append({
+                "description": str(desc).strip(),
+                "amount": amt,
+                "date": r.get(date_col) if date_col else None,
+                "category": _row_category(r),
+            })
+        return pd.DataFrame(rows).reset_index(drop=True), total_in
 
     if "debit" in col_map:
         rows = []
@@ -716,6 +859,7 @@ def _load_csv(uploaded_file) -> tuple[pd.DataFrame, float]:
                 "description": str(desc).strip(),
                 "amount": amt,
                 "date": r.get(date_col) if date_col else None,
+                "category": _row_category(r),
             })
         return pd.DataFrame(rows).reset_index(drop=True), total_in
 
@@ -743,8 +887,10 @@ def _load_csv(uploaded_file) -> tuple[pd.DataFrame, float]:
     work = work.rename(columns={desc_col: "description"})
     if date_col:
         work = work.rename(columns={date_col: "date"})
+    if category_col:
+        work = work.rename(columns={category_col: "category"})
 
-    keep_cols = [c for c in ["description", "amount", "date"] if c in work.columns]
+    keep_cols = [c for c in ["description", "amount", "date", "category"] if c in work.columns]
     result = work[keep_cols].dropna(subset=["description", "amount"]).reset_index(drop=True)
     return result, total_in
 
@@ -970,7 +1116,28 @@ def compute_summary(df: pd.DataFrame) -> dict:
 
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df = df.dropna(subset=["amount", "description"])
-    df["category"] = df["description"].apply(categorize)
+
+    # The source file's own category (when it has one) is more accurate
+    # than any guess we'd make from the description text — only fall back
+    # to the keyword categorizer for rows with no source category at all.
+    if "category" in df.columns:
+        df["category"] = df["category"].fillna("").astype(str).str.strip()
+        missing = df["category"] == ""
+        if missing.any():
+            df.loc[missing, "category"] = df.loc[missing, "description"].apply(categorize)
+    else:
+        df["category"] = df["description"].apply(categorize)
+
+    # Layer in any AI-assisted categorizations from a previous "Categorize
+    # remaining with AI" click. Keyed by description text and stored in
+    # session_state since this function recomputes from scratch on every
+    # script rerun (new upload, toggle, etc.).
+    ai_map = st.session_state.get("ai_category_map", {})
+    if ai_map:
+        still_other = df["category"].isin(["Other", ""])
+        if still_other.any():
+            mapped = df.loc[still_other, "description"].map(ai_map)
+            df.loc[still_other, "category"] = mapped.fillna(df.loc[still_other, "category"])
 
     has_date = "date" in df.columns
     if has_date:
@@ -983,6 +1150,7 @@ def compute_summary(df: pd.DataFrame) -> dict:
     avg_transaction = df["amount"].mean() if num_transactions else 0
     by_category = df.groupby("category")["amount"].sum().sort_values(ascending=False)
     recent = df.sort_values("amount", ascending=False).head(8)
+    other_count = int((df["category"] == "Other").sum())
 
     return {
         "total_spending": total_spending,
@@ -993,6 +1161,7 @@ def compute_summary(df: pd.DataFrame) -> dict:
         "amount_col": "amount",
         "has_date": has_date,
         "df": df,
+        "other_count": other_count,
     }
 
 
@@ -1288,6 +1457,29 @@ with col_left:
             {rows_html}
         </div>
     """)
+
+    if summary["other_count"] > 0:
+        st.caption(
+            f"{summary['other_count']} transaction(s) still under \"Other\" — "
+            "no category in the file and no keyword match."
+        )
+        if st.button("🧠 Categorize remaining with AI", use_container_width=False):
+            other_descriptions = (
+                summary["df"].loc[summary["df"]["category"] == "Other", "description"]
+                .dropna().unique().tolist()
+            )
+            with st.spinner("Asking the AI to classify the rest..."):
+                new_map = ai_categorize(other_descriptions)
+            if new_map:
+                existing_map = st.session_state.get("ai_category_map", {})
+                existing_map.update(new_map)
+                st.session_state["ai_category_map"] = existing_map
+                st.rerun()
+            else:
+                st.warning(
+                    "Couldn't get AI categorization right now — check your "
+                    "OpenRouter key/credits and try again."
+                )
 
 with col_right:
     rows_html = ""
